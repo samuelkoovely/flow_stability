@@ -134,3 +134,7 @@ dmypy.json
 *.DS_Store
 
 examples/
+flow_stability_env
+figures/
+*.txt
+*.cpp
