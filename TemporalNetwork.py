@@ -26,6 +26,8 @@ import numpy as np
 from scipy.sparse import (lil_matrix, dok_matrix, diags, eye, isspmatrix_csr, isspmatrix,
                           csr_matrix, coo_matrix, csc_matrix)
 from scipy.sparse.linalg import expm, eigsh
+from scipy.linalg import expm as d_expm
+from scipy.linalg import logm as d_logm
 from scipy.sparse.csgraph import connected_components
 import gzip
 from SparseStochMat import sparse_stoch_mat, inplace_csr_row_normalize
@@ -36,7 +38,7 @@ from functools import partial
 
 import time
 import pickle
-
+from math import exp
 
 class ContTempNetwork(object):
     """ Continuous time temporal network
@@ -1726,8 +1728,10 @@ class ContTempNetwork(object):
                 # since CSR @ SparseStochMat t is not implemented
                 p = p0 @ self.T[lamda][k_init].tocsr()
                 T = self.T[lamda][k_init].tocsr()
-                logTdata = np.log(T.data, where = T.data>0)
+                logTdata = np.log(np.where(T.data > 0, T.data, 1))
                 TlogT = csr_matrix((T.data*logTdata, T.indices, T.indptr), shape=T.shape)
+                # there shouldn't be need for this
+                # TlogT[TlogT>0]=0
                 self.S[lamda] = [-np.sum(p0 @ TlogT, where= np.isfinite(p0 @ TlogT))]
             else:
                 raise Exception("Use force_csr=True")
@@ -1760,10 +1764,11 @@ class ContTempNetwork(object):
                     
                 p = p0 @ self.T[lamda][k]
                 T = self.T[lamda][k].tocsr()
-                logT = np.log(T.data, where = T.data>0)
-                TlogT = T.data*logT
-                TlogT[TlogT>0]=0
-                TlogT = csr_matrix((TlogT, T.indices, T.indptr), shape=T.shape)
+                logTdata = np.log(np.where(T.data > 0, T.data, 1))
+                TlogTdata = T.data * logTdata
+                # there shouldn't be need for this
+                # TlogT[TlogT>0]=0
+                TlogT = csr_matrix((TlogTdata, T.indices, T.indptr), shape=T.shape)
                 self.S[lamda].append(-np.sum(p0 @ TlogT, where= np.isfinite(p0 @ TlogT)))
                 
             t_end = time.time()-t0
@@ -2126,7 +2131,7 @@ class ContTempNetwork(object):
                 T = self.T[lamda][k_init].tocsr()
                 Q = -lamda*self.laplacians[k_init]
                 diagpQ= diagp @ Q
-                array_diagpQ = np.asarray(diagpQ.todense())
+                array_diagpQ = np.asarray(diagpQ.toarray())
                 
                 entropy2 = 0
                 for i in range(array_diagpQ.shape[0]):
@@ -2152,7 +2157,7 @@ class ContTempNetwork(object):
                 T = self.T[lamda][k].tocsr()
                 Q = -lamda*self.laplacians[k]
                 diagpQ= diagp @ Q
-                array_diagpQ = np.asarray(diagpQ.todense())
+                array_diagpQ = np.asarray(diagpQ.toarray())
                 
                 entropy2 = 0
                 for i in range(array_diagpQ.shape[0]):
@@ -3442,7 +3447,7 @@ class StaticTempNetwork(object):
             print('PID ', os.getpid(), ' : ','Computing Laplacians')       
     
         t0 = time.time()
-        np_adjacency = self.adjacency.todense()
+        np_adjacency = self.adjacency.toarray()
         if random_walk is True:
             # Calculate the degree vector (sum of non-zero elements in each row)
             degree_vector = np.array(np_adjacency.sum(axis=1)).ravel()
@@ -3456,7 +3461,7 @@ class StaticTempNetwork(object):
             # Calculate the random walk Laplacian matrix: L_rw = I - D^(-1) * A
             self.laplacians = csr_matrix(np.identity(np_adjacency.shape[0]) - degree_matrix @ np_adjacency)
         else:
-            self.laplacians = csr_matrix(np.identity(np_adjacency.shape[0]) -  np_adjacency)                            
+            self.laplacians = csr_matrix(diags(np.asarray(np_adjacency.sum(1)).squeeze()) - np_adjacency)                            
 
         t_end = time.time()-t0
         
@@ -3553,26 +3558,42 @@ class StaticTempNetwork(object):
                     tau_k = self.times[k] - tk
                 
                 if use_sparse_stoch:
-                    self.inter_T[lamda].append(sparse_lapl_expm(self.laplacians,
-                                                                       tau_k*lamda,
-                                                                       dense_expm=dense_expm))
+                    # self.inter_T[lamda].append(sparse_lapl_expm(self.laplacians,
+                    #                                                    tau_k*lamda,
+                    #                                                    dense_expm=dense_expm))
+                    raise Exception("Shouldn't use use_sparse_stoch=True")
                 else:
                     if self.laplacians.getnnz() == 0:
                         # expm of zero = identity
+                        print('special case: network is empty')
                         self.inter_T[lamda].append(eye(self.num_nodes,format='csr'))
                     else:
                         if dense_expm:
-                            self.inter_T[lamda].append(csr_matrix(expm(-tau_k*lamda*self.laplacians.toarray())))
+                            #self.inter_T[lamda].append(csr_matrix(expm(-tau_k*lamda*self.laplacians.toarray())))
+                            raise Exception("Shouldn't use dense_expm=True")
                         else:
                             self.inter_T[lamda].append(expm(-tau_k*lamda*self.laplacians).tocsr())
+
+                            # M = -tau_k*lamda*self.laplacians.tocsr().toarray()
+                            # n = max(0,int((np.log2(sp_lalg.norm(M)))))
+                            # exp_renorm = np.linalg.matrix_power(sp_lalg.expm(M/(2**n)),2**n)
+                            # self.inter_T[lamda].append(csr_matrix(exp_renorm))
+
+
+                            #exp = np.array(expm(-tau_k*lamda*self.laplacians).tocsr().toarray())
+                            #exp_renorm = exp / np.sum(exp, axis=0)[:,None]
+                            #self.inter_T[lamda].append(csr_matrix(exp_renorm))
+
         
             if len(self.inter_T[lamda]) == 0:
                 if verbose:
                     print('PID ', os.getpid(), ' no events, trans. matrix = identity')
                 # is there was no event, the transition is identity
                 if use_sparse_stoch:
-                    self.inter_T[lamda].append(sparse_stoch_mat.create_diag(size=self.num_nodes))
+                    #self.inter_T[lamda].append(sparse_stoch_mat.create_diag(size=self.num_nodes))
+                    raise Exception("Shouldn't use use_sparse_stoch=True")
                 else:
+                    print('Special case, inter T = eye')
                     self.inter_T[lamda].append(eye(self.num_nodes, 
                                                       dtype=np.float64,
                                                       format='csr'))
@@ -3687,7 +3708,8 @@ class StaticTempNetwork(object):
                                     # save_intermediate=True,
                                     reverse_time=False,
                                     force_csr=True,
-                                    tol=None):
+                                    tol=None,
+                                    time_domain = None):
         """
         
         Computes interevent transition matrices as T_k(lamda) = expm(-tau_k*lamda*L_k).
@@ -3753,15 +3775,17 @@ class StaticTempNetwork(object):
         if not hasattr(self, 'S'):
             self.S = dict()
 
-        
+
+        if time_domain is None:
+            time_domain = self.times()
         if reverse_time:
-            k_init = len(self.inter_T[lamda])-1
+            k_init = len(time_domain)-1
             k_range = reversed(range(0, k_init))
             if verbose:
                 print('PID ', os.getpid(), ' : reversed time computation.')
         else:
             k_init = 0
-            k_range = range(1,len(self.inter_T[lamda]))
+            k_range = range(1,len(time_domain))
             
         p0 = 1/self.num_nodes*np.ones(self.num_nodes)
         
@@ -3773,10 +3797,10 @@ class StaticTempNetwork(object):
                 # since CSR @ SparseStochMat t is not implemented
                 p = p0 @ self.T[lamda][k_init].tocsr()
                 T = self.T[lamda][k_init].tocsr()
-                logT = np.log(T.data, where = T.data>0)
-                TlogT = T.data*logT
-                TlogT[TlogT>0]=0
-                TlogT = csr_matrix((TlogT, T.indices, T.indptr), shape=T.shape)
+                logTdata = np.log(np.where(T.data > 0, T.data, 1))
+                TlogT = csr_matrix((T.data*logTdata, T.indices, T.indptr), shape=T.shape)
+                # there shouldn't be need for this
+                # TlogT[TlogT>0]=0
                 self.S[lamda] = [-np.sum(p0 @ TlogT, where= np.isfinite(p0 @ TlogT))]
             else:
                 raise Exception("Use force_csr=True")
@@ -3808,12 +3832,10 @@ class StaticTempNetwork(object):
                     print(f'PID {os.getpid()} : {time.time()-t0:.2f}s')
                     
                 p = p0 @ self.T[lamda][k]
-
                 T = self.T[lamda][k].tocsr()
-                logT = np.log(T.data, where = T.data>0)
-                TlogT = T.data*logT
-                TlogT[TlogT>0]=0
-                TlogT = csr_matrix((TlogT, T.indices, T.indptr), shape=T.shape)
+                logTdata = np.log(np.where(T.data > 0, T.data, 1))
+                TlogTdata = T.data * logTdata
+                TlogT = csr_matrix((TlogTdata, T.indices, T.indptr), shape=T.shape)
                 self.S[lamda].append(-np.sum(p0 @ TlogT, where= np.isfinite(p0 @ TlogT)))
 
             t_end = time.time()-t0
@@ -3829,7 +3851,8 @@ class StaticTempNetwork(object):
                                     verbose=False,
                                     # save_intermediate=True,
                                     reverse_time=False,
-                                    force_csr=True):
+                                    force_csr=True,
+                                    time_domain=None):
         """
         
         Computes interevent transition matrices as T_k(lamda) = expm(-tau_k*lamda*L_k).
@@ -3897,14 +3920,16 @@ class StaticTempNetwork(object):
             self.vNS = dict()
 
         
+        if time_domain is None:
+            time_domain = self.times()
         if reverse_time:
-            k_init = len(self.inter_T[lamda])-1
+            k_init = len(time_domain)-1
             k_range = reversed(range(0, k_init))
             if verbose:
                 print('PID ', os.getpid(), ' : reversed time computation.')
         else:
             k_init = 0
-            k_range = range(1,len(self.inter_T[lamda]))
+            k_range = range(1,len(time_domain))
             
         
         if lamda not in self.vNS.keys():
@@ -3913,16 +3938,23 @@ class StaticTempNetwork(object):
                 # all products are done in csr format,
                 # since CSR @ SparseStochMat t is not implemented
                 T = self.T[lamda][k_init].tocsr()
-                rho = T/T.trace()
-                np_rho = rho.todense()
-                np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
-                np_rhologrho = np_rho  @ np_logrho
-                # np_rhologrho[np.isnan(np_rhologrho)] = 0
-                rhologrho = csr_matrix(np_rhologrho)
-                del np_rhologrho
-                del np_rho
-                del np_logrho
-                self.vNS[lamda] = [-rhologrho.trace()]
+                T = T.toarray()
+                rho = T/np.trace(T)
+                #np_rho = rho.toarray()
+                #np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
+                #np_rhologrho = np_rho  @ np_logrho
+                ## np_rhologrho[np.isnan(np_rhologrho)] = 0
+                #rhologrho = csr_matrix(np_rhologrho)
+                #del np_rhologrho
+                #del np_rho
+                #del np_logrho
+                #self.vNS[lamda] = [-rhologrho.trace()]
+
+                rhologrho = rho @ d_logm(rho)
+                self.vNS[lamda] = [- 1/np.log(self.num_nodes) * np.trace(rhologrho)]
+                del T
+                del rho
+                del rhologrho
             else:
                 raise Exception
          
@@ -3937,17 +3969,23 @@ class StaticTempNetwork(object):
                     print(f'PID {os.getpid()} : {time.time()-t0:.2f}s')
                     
                 T = self.T[lamda][k].tocsr()
-                rho = T/T.trace()
-                np_rho = rho.todense()
-                np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
-                np_rhologrho = np_rho  @ np_logrho
-                # np_rhologrho[np.isnan(np_rhologrho)] = 0
-                rhologrho = csr_matrix(np_rhologrho)
-                del np_rhologrho
-                del np_rho
-                del np_logrho
-                self.vNS[lamda].append(-rhologrho.trace())
-              
+                T = T.toarray()
+                rho = T/np.trace(T)
+                #np_rho = rho.toarray()
+                #np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
+                #np_rhologrho = np_rho  @ np_logrho
+                ## np_rhologrho[np.isnan(np_rhologrho)] = 0
+                #rhologrho = csr_matrix(np_rhologrho)
+                #del np_rhologrho
+                #del np_rho
+                #del np_logrho
+                #self.vNS[lamda].append(-rhologrho.trace())
+
+                rhologrho = rho @ d_logm(rho)
+                self.vNS[lamda].append(- 1/np.log(self.num_nodes) * np.trace(rhologrho))
+                del T
+                del rho
+                del rhologrho
             t_end = time.time()-t0
             
             
@@ -3961,7 +3999,8 @@ class StaticTempNetwork(object):
                                     verbose=False,
                                     # save_intermediate=True,
                                     reverse_time=False,
-                                    force_csr=True):
+                                    force_csr=True,
+                                    time_domain=None):
         """
         
         Computes interevent transition matrices as T_k(lamda) = expm(-tau_k*lamda*L_k).
@@ -4029,14 +4068,16 @@ class StaticTempNetwork(object):
             self.simple_vNS = dict()
 
         
+        if time_domain is None:
+            time_domain = self.times()
         if reverse_time:
-            k_init = len(self.inter_T[lamda])-1
+            k_init = len(time_domain)-1
             k_range = reversed(range(0, k_init))
             if verbose:
                 print('PID ', os.getpid(), ' : reversed time computation.')
         else:
             k_init = 0
-            k_range = range(1,len(self.inter_T[lamda]))
+            k_range = range(1,len(time_domain))
             
         
         if lamda not in self.simple_vNS.keys():
@@ -4045,16 +4086,20 @@ class StaticTempNetwork(object):
                 # all products are done in csr format,
                 # since CSR @ SparseStochMat t is not implemented
                 T = self.T[lamda][k_init].tocsr()
-                rho = T/T.trace()
-                np_rho = rho.todense()
-                np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
-                np_rhologrho = np_rho  * np_logrho
-                # np_rhologrho[np.isnan(np_rhologrho)] = 0
-                rhologrho = csr_matrix(np_rhologrho)
-                del np_rhologrho
-                del np_rho
-                del np_logrho
-                self.simple_vNS[lamda] = [-rhologrho.trace()]
+                T = T.toarray()
+                rho = T/np.trace(T)
+                # np_rho = rho.toarray()
+                # np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
+                # np_rhologrho = np_rho  * np_logrho
+                # # np_rhologrho[np.isnan(np_rhologrho)] = 0
+                # rhologrho = csr_matrix(np_rhologrho)
+                # del np_rhologrho
+                # del np_rho
+                # del np_logrho
+                # self.simple_vNS[lamda] = [-rhologrho.trace()]
+                
+                L = self.laplacians.toarray()
+                self.simple_vNS[lamda] = [1/np.log(self.num_nodes) * (np.trace(self.times[k_init] * rho @ L) + np.log(np.trace(T)))]
             else:
                 raise Exception("Use force_csr=True")
                 '''p = p0 @ self.T[lamda][k_init]
@@ -4074,18 +4119,22 @@ class StaticTempNetwork(object):
                     print(f'PID {os.getpid()} : {time.time()-t0:.2f}s')
                     
                 T = self.T[lamda][k].tocsr()
-                rho = T/T.trace()
-                np_rho = rho.todense()
-                np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
-                np_rhologrho = np_rho  * np_logrho
-                # np_rhologrho[np.isnan(np_rhologrho)] = 0
-                rhologrho = csr_matrix(np_rhologrho)
-                del np_rhologrho
-                del np_rho
-                del np_logrho
-                self.simple_vNS[lamda].append(-rhologrho.trace())
+                T = T.toarray()
+                rho = T/np.trace(T)
+                # np_rho = rho.toarray()
+                # np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
+                # np_rhologrho = np_rho  * np_logrho
+                # # np_rhologrho[np.isnan(np_rhologrho)] = 0
+                # rhologrho = csr_matrix(np_rhologrho)
+                # del np_rhologrho
+                # del np_rho
+                # del np_logrho
+                # self.simple_vNS[lamda].append(-rhologrho.trace())
+                L = self.laplacians.toarray()
+                self.simple_vNS[lamda].append(1/np.log(self.num_nodes) * np.trace(self.times[k] * rho @ L) + np.log(np.trace(T)))
+                del T
+                del rho
 
-                
             t_end = time.time()-t0
             
             
@@ -4189,7 +4238,7 @@ class StaticTempNetwork(object):
                 T = self.T[lamda][k_init].tocsr()
                 Q = -lamda*self.laplacians[k_init]
                 diagpQ= diagp @ Q
-                array_diagpQ = np.asarray(diagpQ.todense())
+                array_diagpQ = np.asarray(diagpQ.toarray())
                 
                 entropy2 = 0
                 for i in range(array_diagpQ.shape[0]):
@@ -4215,7 +4264,7 @@ class StaticTempNetwork(object):
                 T = self.T[lamda][k].tocsr()
                 Q = -lamda*self.laplacians[k]
                 diagpQ= diagp @ Q
-                array_diagpQ = np.asarray(diagpQ.todense())
+                array_diagpQ = np.asarray(diagpQ.toarray())
                 
                 entropy2 = 0
                 for i in range(array_diagpQ.shape[0]):
@@ -4238,7 +4287,8 @@ class StaticTempNetwork(object):
                                     verbose=False,
                                     # save_intermediate=True,
                                     reverse_time=False,
-                                    force_csr=True):
+                                    force_csr=True,
+                                    time_domain=None):
         """
         
         Computes interevent transition matrices as T_k(lamda) = expm(-tau_k*lamda*L_k).
@@ -4306,14 +4356,16 @@ class StaticTempNetwork(object):
             self.new_vNS = dict()
 
         
+        if time_domain is None:
+            time_domain = self.times()
         if reverse_time:
-            k_init = len(self.inter_T[lamda])-1
+            k_init = len(time_domain)-1
             k_range = reversed(range(0, k_init))
             if verbose:
                 print('PID ', os.getpid(), ' : reversed time computation.')
         else:
-            k_init = 0
-            k_range = range(1,len(self.inter_T[lamda]))
+            k_init = len(time_domain)-1
+            k_range = range(1,len(time_domain))
             
         
         if lamda not in self.new_vNS.keys():
@@ -4324,8 +4376,8 @@ class StaticTempNetwork(object):
                 L = self.laplacians
                 T = self.T[lamda][k_init].tocsr()
                 rho = T/T.trace()
-                t0= self.times[0]
-                self.new_vNS[lamda] = [-lamda * t0 * (rho @ L).trace() + np.log(T.trace())]
+                t0= time_domain[0]
+                self.new_vNS[lamda] = [- lamda * t0 * (rho @ L).trace() + np.log(T.trace())]
             else:
                 raise Exception
          
@@ -4342,8 +4394,8 @@ class StaticTempNetwork(object):
                 L = self.laplacians
                 T = self.T[lamda][k].tocsr()
                 rho = T/T.trace()
-                tk= self.times[k]
-                self.new_vNS[lamda].append(-lamda * tk * (rho @ L).trace() + np.log(T.trace()))
+                tk= time_domain[k]
+                self.new_vNS[lamda].append(- lamda * tk * (rho @ L).trace() + np.log(T.trace()))
               
             t_end = time.time()-t0
             
@@ -4358,7 +4410,8 @@ class StaticTempNetwork(object):
                                 verbose=False,
                                 # save_intermediate=True,
                                 reverse_time=False,
-                                force_csr=True):
+                                force_csr=True,
+                                time_domain=None):
         """
         
         Computes interevent transition matrices as T_k(lamda) = expm(-tau_k*lamda*L_k).
@@ -4426,14 +4479,16 @@ class StaticTempNetwork(object):
             self.spectral_vNS = dict()
 
         
+        if time_domain is None:
+            time_domain = self.inter_T[lamda]
         if reverse_time:
-            k_init = len(self.inter_T[lamda])-1
+            k_init = len(time_domain)-1
             k_range = reversed(range(0, k_init))
             if verbose:
                 print('PID ', os.getpid(), ' : reversed time computation.')
         else:
             k_init = 0
-            k_range = range(1,len(self.inter_T[lamda]))
+            k_range = range(1,len(time_domain))
             
         
         if lamda not in self.spectral_vNS.keys():
@@ -4442,12 +4497,19 @@ class StaticTempNetwork(object):
                 # all products are done in csr format,
                 # since CSR @ SparseStochMat t is not implemented
                 T = self.T[lamda][k_init].tocsr()
+                T = T.toarray()
                 rho = T/T.trace()
-                spectrum_rho = [z.real for z in eigsh(rho, k=self.num_nodes-2)[0]] # num_nodes -2 becusae of limits of eigs in number of eigevanlues
-                spectrum_rho = np.array(spectrum_rho)
-                log_spectrum_rho = np.log(np.where(spectrum_rho > 0, spectrum_rho, 1)) # make sure to have only positive eigenvalues
-                spectrum_vNS = - np.sum(spectrum_rho*log_spectrum_rho) / (self.num_nodes-2)
-                self.spectral_vNS[lamda] = [spectrum_vNS]
+                # spectrum_rho = [z.real for z in eigsh(rho, k=self.num_nodes-2)[0]] # num_nodes -2 becusae of limits of eigs in number of eigevanlues
+                # spectrum_rho = np.array(spectrum_rho)
+                # log_spectrum_rho = np.log(np.where(spectrum_rho > 0, spectrum_rho, 1)) # make sure to have only positive eigenvalues
+                # spectrum_vNS = - np.sum(spectrum_rho*log_spectrum_rho) / (self.num_nodes-2)
+                # self.spectral_vNS[lamda] = [spectrum_vNS]
+
+                eigs = np.linalg.eigvalsh(rho) # this is for numpy arrays and it returns all the eigenvalues
+                eigs = np.where(eigs > 0, eigs, 1)
+                self.spectral_vNS[lamda] = [- 1/np.log(self.num_nodes) * np.sum(eigs*np.log(eigs))]
+                del T
+                del rho
             else:
                 raise Exception
             
@@ -4462,12 +4524,19 @@ class StaticTempNetwork(object):
                     print(f'PID {os.getpid()} : {time.time()-t0:.2f}s')
                     
                 T = self.T[lamda][k].tocsr()
+                T = T.toarray()
                 rho = T/T.trace()
-                spectrum_rho = [z.real for z in eigsh(rho, k=self.num_nodes-2)[0]] # num_nodes -2 becusae of limits of eigs in number of eigevanlues
-                spectrum_rho = np.array(spectrum_rho)
-                log_spectrum_rho = np.log(np.where(spectrum_rho > 0, spectrum_rho, 1)) # make sure to have only positive eigenvalues
-                spectrum_vNS = - np.sum(spectrum_rho*log_spectrum_rho) / (self.num_nodes-2)
-                self.spectral_vNS[lamda].append(spectrum_vNS)
+                # spectrum_rho = [z.real for z in eigsh(rho, k=self.num_nodes-2)[0]] # num_nodes -2 becusae of limits of eigs in number of eigevanlues
+                # spectrum_rho = np.array(spectrum_rho)
+                # log_spectrum_rho = np.log(np.where(spectrum_rho > 0, spectrum_rho, 1)) # make sure to have only positive eigenvalues
+                # spectrum_vNS = - np.sum(spectrum_rho*log_spectrum_rho) / (self.num_nodes-2)
+                # self.spectral_vNS[lamda].append(spectrum_vNS)
+
+                eigs = np.linalg.eigvalsh(rho) # this is for numpy arrays and it returns all the eigenvalues
+                eigs = np.where(eigs > 0, eigs, 1)
+                self.spectral_vNS[lamda].append(- 1/np.log(self.num_nodes) * np.sum(eigs*np.log(eigs)))
+                del T
+                del rho
             
             t_end = time.time()-t0
             
