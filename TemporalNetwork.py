@@ -1107,7 +1107,8 @@ class ContTempNetwork(object):
             
     def compute_laplacian_matrices(self, t_start=None,
                                        t_stop=None, verbose=False,
-                                       save_adjacencies=False):
+                                       save_adjacencies=False,
+                                       random_walk=True):
         """ Computes the laplacian matrices and saves them in `self.laplacians`
             
             Computes from the first event time (in `self.times`) before or equal to `t_start` until
@@ -1186,111 +1187,209 @@ class ContTempNetwork(object):
                                     
         t0 = time.time()
 
-        if self._k_start_laplacians > 0:
-            # initial conditions, we have to find the adjacency mat just before
-            # _k_start_laplacians. 
-            
-            t_km1 = self.times[self._k_start_laplacians-1]
-            
-            # find events that have started before or at t_k-1
-            # and were still occuring at t_k-1
-            mask_ini = (self.events_table.starting_times <= \
-                                                t_km1) & \
-                        (self.events_table.ending_times > \
-                                                t_km1)
-            
-            for event in self.events_table.loc[mask_ini][['source_nodes',
-                                          'target_nodes']].itertuples():
+        if random_walk is True:
+            if self._k_start_laplacians > 0:
+                # initial conditions, we have to find the adjacency mat just before
+                # _k_start_laplacians. 
                 
-                if A[event.source_nodes, event.target_nodes] != 1:
-                        A[event.source_nodes, event.target_nodes] = 1
-                        A[event.target_nodes, event.source_nodes] = 1
+                t_km1 = self.times[self._k_start_laplacians-1]
+                
+                # find events that have started before or at t_k-1
+                # and were still occuring at t_k-1
+                mask_ini = (self.events_table.starting_times <= \
+                                                    t_km1) & \
+                            (self.events_table.ending_times > \
+                                                    t_km1)
+                
+                for event in self.events_table.loc[mask_ini][['source_nodes',
+                                            'target_nodes']].itertuples():
+                    
+                    if A[event.source_nodes, event.target_nodes] != 1:
+                            A[event.source_nodes, event.target_nodes] = 1
+                            A[event.target_nodes, event.source_nodes] = 1
+                            
+                            degrees[event.source_nodes] += 1
+                            degrees[event.target_nodes] += 1
+                    
+                    if degrees[event.source_nodes] == 0:
+                            S.data[event.source_nodes] = 1
+                            Dm1.data[event.source_nodes] = 1
+                    else:
+                        S.data[event.source_nodes] = 0
+                        Dm1.data[event.source_nodes] = 1/degrees[event.source_nodes]
                         
-                        degrees[event.source_nodes] += 1
-                        degrees[event.target_nodes] += 1
+                    if degrees[event.target_nodes] == 0:
+                        S.data[event.target_nodes] = 1
+                        Dm1.data[event.target_nodes] = 1
+                    else:
+                        S.data[event.target_nodes] = 0
+                        Dm1.data[event.target_nodes] = 1/degrees[event.target_nodes]
+
+
+            # time grid for this time range            
+            time_grid_range = self.time_grid.loc[\
+                    (self.time_grid.index.get_level_values('times') >= \
+                        self._t_start_laplacians) & \
+                    (self.time_grid.index.get_level_values('times') < \
+                        self._t_stop_laplacians)]
+                        
+            for k, (tk, time_ev) in enumerate(time_grid_range.groupby(level='times')):
+                if verbose and not k%1000:
+                    print('PID ', os.getpid(), ' : ',k, ' over ' , 
+                        self._k_stop_laplacians - self._k_start_laplacians)
+                    print(f'PID {os.getpid()} : {time.time()-t0:.2f}s')
+                                
+                meet_id = time_ev.index.get_level_values('id')
+                # starting or ending events
+                is_starts = time_ev.is_start.values
                 
-                if degrees[event.source_nodes] == 0:
+                
+                events_k = [self.events_table.loc[mid,['source_nodes','target_nodes']].astype(np.int64) \
+                                            for mid in meet_id.values]            
+                
+                #update instantaneous matrices
+                for event, is_start in zip(events_k, is_starts):
+                    # unweighted, undirected
+                    if is_start:
+                        # if they are not already connected (can happen if the 
+                        # opposite event overlap)
+                        if A[event.source_nodes, event.target_nodes] != 1:
+                            A[event.source_nodes, event.target_nodes] = 1
+                            A[event.target_nodes, event.source_nodes] = 1
+                            
+                            degrees[event.source_nodes] += 1
+                            degrees[event.target_nodes] += 1
+                            
+                    else:
+                        #end of meeting
+                        # if they are already unconnected
+                        if A[event.source_nodes, event.target_nodes] > 0:
+                            A[event.source_nodes, event.target_nodes] = 0
+                            A[event.target_nodes, event.source_nodes] = 0
+                            
+                            degrees[event.source_nodes] -= 1
+                            degrees[event.target_nodes] -= 1
+                
+                    # update self loops        
+                    if degrees[event.source_nodes] == 0:
                         S.data[event.source_nodes] = 1
                         Dm1.data[event.source_nodes] = 1
-                else:
-                    S.data[event.source_nodes] = 0
-                    Dm1.data[event.source_nodes] = 1/degrees[event.source_nodes]
+                    else:
+                        S.data[event.source_nodes] = 0
+                        Dm1.data[event.source_nodes] = 1/degrees[event.source_nodes]
+                        
+                    if degrees[event.target_nodes] == 0:
+                        S.data[event.target_nodes] = 1
+                        Dm1.data[event.target_nodes] = 1
+                    else:
+                        S.data[event.target_nodes] = 0
+                        Dm1.data[event.target_nodes] = 1/degrees[event.target_nodes]
+                
+                # Laplacian L(tk)
+                Acsc = A.tocsc()
+                T_D = Dm1 @ (Acsc + S)
+                L = I - T_D
+            
+                self.laplacians.append(I - Dm1 @ (Acsc + S)) #(I - Acsc)
+                if save_adjacencies:
+                    self.adjacencies.append(A.copy())
+        else: #case random_walk is False
+            if self._k_start_laplacians > 0:
+                # initial conditions, we have to find the adjacency mat just before
+                # _k_start_laplacians. 
+                
+                t_km1 = self.times[self._k_start_laplacians-1]
+                
+                # find events that have started before or at t_k-1
+                # and were still occuring at t_k-1
+                mask_ini = (self.events_table.starting_times <= \
+                                                    t_km1) & \
+                            (self.events_table.ending_times > \
+                                                    t_km1)
+                
+                for event in self.events_table.loc[mask_ini][['source_nodes',
+                                            'target_nodes']].itertuples():
                     
-                if degrees[event.target_nodes] == 0:
-                    S.data[event.target_nodes] = 1
-                    Dm1.data[event.target_nodes] = 1
-                else:
-                    S.data[event.target_nodes] = 0
-                    Dm1.data[event.target_nodes] = 1/degrees[event.target_nodes]
-
-
-        # time grid for this time range            
-        time_grid_range = self.time_grid.loc[\
-                  (self.time_grid.index.get_level_values('times') >= \
-                       self._t_start_laplacians) & \
-                  (self.time_grid.index.get_level_values('times') < \
-                       self._t_stop_laplacians)]
-                    
-        for k, (tk, time_ev) in enumerate(time_grid_range.groupby(level='times')):
-            if verbose and not k%1000:
-                print('PID ', os.getpid(), ' : ',k, ' over ' , 
-                      self._k_stop_laplacians - self._k_start_laplacians)
-                print(f'PID {os.getpid()} : {time.time()-t0:.2f}s')
-                            
-            meet_id = time_ev.index.get_level_values('id')
-            # starting or ending events
-            is_starts = time_ev.is_start.values
-            
-            
-            events_k = [self.events_table.loc[mid,['source_nodes','target_nodes']].astype(np.int64) \
-                                        for mid in meet_id.values]            
-            
-            #update instantaneous matrices
-            for event, is_start in zip(events_k, is_starts):
-                # unweighted, undirected
-                if is_start:
-                    # if they are not already connected (can happen if the 
-                    # opposite event overlap)
                     if A[event.source_nodes, event.target_nodes] != 1:
-                        A[event.source_nodes, event.target_nodes] = 1
-                        A[event.target_nodes, event.source_nodes] = 1
-                        
-                        degrees[event.source_nodes] += 1
-                        degrees[event.target_nodes] += 1
-                        
-                else:
-                    #end of meeting
-                    # if they are already unconnected
-                    if A[event.source_nodes, event.target_nodes] > 0:
-                        A[event.source_nodes, event.target_nodes] = 0
-                        A[event.target_nodes, event.source_nodes] = 0
-                        
-                        degrees[event.source_nodes] -= 1
-                        degrees[event.target_nodes] -= 1
-            
-                # update self loops        
-                if degrees[event.source_nodes] == 0:
-                    S.data[event.source_nodes] = 1
-                    Dm1.data[event.source_nodes] = 1
-                else:
-                    S.data[event.source_nodes] = 0
-                    Dm1.data[event.source_nodes] = 1/degrees[event.source_nodes]
+                            A[event.source_nodes, event.target_nodes] = 1
+                            A[event.target_nodes, event.source_nodes] = 1
+                            
+                            degrees[event.source_nodes] += 1
+                            degrees[event.target_nodes] += 1
                     
-                if degrees[event.target_nodes] == 0:
-                    S.data[event.target_nodes] = 1
-                    Dm1.data[event.target_nodes] = 1
-                else:
-                    S.data[event.target_nodes] = 0
-                    Dm1.data[event.target_nodes] = 1/degrees[event.target_nodes]
+                    if degrees[event.source_nodes] == 0:
+                            Dm1.data[event.source_nodes] = 1
+                    else:
+                        Dm1.data[event.source_nodes] = degrees[event.source_nodes]
+                        
+                    if degrees[event.target_nodes] == 0:
+                        Dm1.data[event.target_nodes] = 1
+                    else:
+                        Dm1.data[event.target_nodes] = degrees[event.target_nodes]
+
+
+            # time grid for this time range            
+            time_grid_range = self.time_grid.loc[\
+                    (self.time_grid.index.get_level_values('times') >= \
+                        self._t_start_laplacians) & \
+                    (self.time_grid.index.get_level_values('times') < \
+                        self._t_stop_laplacians)]
+                        
+            for k, (tk, time_ev) in enumerate(time_grid_range.groupby(level='times')):
+                if verbose and not k%1000:
+                    print('PID ', os.getpid(), ' : ',k, ' over ' , 
+                        self._k_stop_laplacians - self._k_start_laplacians)
+                    print(f'PID {os.getpid()} : {time.time()-t0:.2f}s')
+                                
+                meet_id = time_ev.index.get_level_values('id')
+                # starting or ending events
+                is_starts = time_ev.is_start.values
+                
+                
+                events_k = [self.events_table.loc[mid,['source_nodes','target_nodes']].astype(np.int64) \
+                                            for mid in meet_id.values]            
+                
+                #update instantaneous matrices
+                for event, is_start in zip(events_k, is_starts):
+                    # unweighted, undirected
+                    if is_start:
+                        # if they are not already connected (can happen if the 
+                        # opposite event overlap)
+                        if A[event.source_nodes, event.target_nodes] != 1:
+                            A[event.source_nodes, event.target_nodes] = 1
+                            A[event.target_nodes, event.source_nodes] = 1
+                            
+                            degrees[event.source_nodes] += 1
+                            degrees[event.target_nodes] += 1
+                            
+                    else:
+                        #end of meeting
+                        # if they are already unconnected
+                        if A[event.source_nodes, event.target_nodes] > 0:
+                            A[event.source_nodes, event.target_nodes] = 0
+                            A[event.target_nodes, event.source_nodes] = 0
+                            
+                            degrees[event.source_nodes] -= 1
+                            degrees[event.target_nodes] -= 1
+                
+                    # update self loops        
+                    if degrees[event.source_nodes] == 0:
+                        Dm1.data[event.source_nodes] = 0
+                    else:
+                        Dm1.data[event.source_nodes] = degrees[event.source_nodes]
+                        
+                    if degrees[event.target_nodes] == 0:
+                        Dm1.data[event.target_nodes] = 0
+                    else:
+                        Dm1.data[event.target_nodes] = degrees[event.target_nodes]
+                
+                # Laplacian L(tk)
+                Acsc = A.tocsc()
+                L = Dm1 - Acsc
             
-            # Laplacian L(tk)
-            Acsc = A.tocsc()
-            T_D = Dm1 @ (Acsc + S)
-            L = I - T_D
-        
-            self.laplacians.append(I - Dm1 @ (Acsc + S)) #(I - Acsc)
-            if save_adjacencies:
-                self.adjacencies.append(A.copy())
+                self.laplacians.append(Dm1 - Acsc)
+                if save_adjacencies:
+                    self.adjacencies.append(A.copy())
             
         t_end = time.time()-t0
         self._compute_times['laplacians'] = t_end
@@ -1785,7 +1884,8 @@ class ContTempNetwork(object):
                                     verbose=False,
                                     # save_intermediate=True,
                                     reverse_time=False,
-                                    force_csr=True):
+                                    force_csr=True,
+                                    time_domain=None):
         """
         
         Computes interevent transition matrices as T_k(lamda) = expm(-tau_k*lamda*L_k).
@@ -1853,14 +1953,16 @@ class ContTempNetwork(object):
             self.vNS = dict()
 
         
+        if time_domain is None:
+            time_domain = self.times()
         if reverse_time:
-            k_init = len(self.inter_T[lamda])-1
+            k_init = len(time_domain)-1
             k_range = reversed(range(0, k_init))
             if verbose:
                 print('PID ', os.getpid(), ' : reversed time computation.')
         else:
             k_init = 0
-            k_range = range(1,len(self.inter_T[lamda]))
+            k_range = range(1,len(time_domain))
             
         
         if lamda not in self.vNS.keys():
@@ -1869,12 +1971,13 @@ class ContTempNetwork(object):
                 # all products are done in csr format,
                 # since CSR @ SparseStochMat t is not implemented
                 T = self.T[lamda][k_init].tocsr()
-                rho = T/T.trace()
-                np_rhologrho = rho.data @ np.log(rho.data)
-                np_rhologrho[np.isnan(np_rhologrho)] = 0
-                rhologrho = csr_matrix((rho.data @ np.log(rho.data), rho.indices, rho.indptr), shape=rho.shape)
-                del np_rhologrho
-                self.vNS[lamda] = [-rhologrho.trace()]
+                T = T.toarray()
+                rho = T/np.trace(T)
+                rhologrho = rho @ d_logm(rho)
+                self.vNS[lamda] = [- 1/np.log(self.num_nodes) * np.trace(rhologrho)]
+                del T
+                del rho
+                del rhologrho
             else:
                 raise Exception
          
@@ -1889,14 +1992,15 @@ class ContTempNetwork(object):
                     print(f'PID {os.getpid()} : {time.time()-t0:.2f}s')
                     
                 T = self.T[lamda][k].tocsr()
-                rho = T/T.trace()
-                np_rhologrho = rho.data @ np.log(rho.data)
-                np_rhologrho[np.isnan(np_rhologrho)] = 0
-                rhologrho = csr_matrix((np_rhologrho, rho.indices, rho.indptr), shape=rho.shape)
-                del np_rhologrho
-                self.vNS[lamda].append(-rhologrho.trace())
-              
+                T = T.toarray()
+                rho = T/np.trace(T)
+                rhologrho = rho @ d_logm(rho)
+                self.vNS[lamda].append(- 1/np.log(self.num_nodes) * np.trace(rhologrho))
+                del T
+                del rho
+                del rhologrho
             t_end = time.time()-t0
+              
             
             self._compute_times['von Neumman entropy_{0}_rev{1}'.format(lamda,reverse_time)] = t_end
             
@@ -3940,16 +4044,6 @@ class StaticTempNetwork(object):
                 T = self.T[lamda][k_init].tocsr()
                 T = T.toarray()
                 rho = T/np.trace(T)
-                #np_rho = rho.toarray()
-                #np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
-                #np_rhologrho = np_rho  @ np_logrho
-                ## np_rhologrho[np.isnan(np_rhologrho)] = 0
-                #rhologrho = csr_matrix(np_rhologrho)
-                #del np_rhologrho
-                #del np_rho
-                #del np_logrho
-                #self.vNS[lamda] = [-rhologrho.trace()]
-
                 rhologrho = rho @ d_logm(rho)
                 self.vNS[lamda] = [- 1/np.log(self.num_nodes) * np.trace(rhologrho)]
                 del T
@@ -3971,16 +4065,6 @@ class StaticTempNetwork(object):
                 T = self.T[lamda][k].tocsr()
                 T = T.toarray()
                 rho = T/np.trace(T)
-                #np_rho = rho.toarray()
-                #np_logrho = np.log(np.where(np_rho != 0, np_rho, 1))
-                #np_rhologrho = np_rho  @ np_logrho
-                ## np_rhologrho[np.isnan(np_rhologrho)] = 0
-                #rhologrho = csr_matrix(np_rhologrho)
-                #del np_rhologrho
-                #del np_rho
-                #del np_logrho
-                #self.vNS[lamda].append(-rhologrho.trace())
-
                 rhologrho = rho @ d_logm(rho)
                 self.vNS[lamda].append(- 1/np.log(self.num_nodes) * np.trace(rhologrho))
                 del T
